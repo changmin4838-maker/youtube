@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/*.db
+data/*.sqlite3
+data/uploads/
+.streamlit/secrets.toml
+*.csv
+.vscode/
+.idea/
+*.log
+.claude/
