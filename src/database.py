@@ -145,6 +145,14 @@ CREATE TABLE IF NOT EXISTS viral_refresh_state (
 );
 """
 
+# 대시보드 헤더에 표시할 "마지막 업데이트" 시각(검색/데이터 갱신 작업 실행 시마다 갱신) 1건만 기록.
+LAST_UPDATE_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS last_update_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at TEXT NOT NULL
+);
+"""
+
 # 사용자가 "새 카테고리 추가"로 직접 등록한 수동 등록 항목용 카테고리.
 # 기본 20종(config.MANUAL_ENTRY_TAGS)에 없는 것만 여기 쌓인다.
 MANUAL_ENTRY_CATEGORIES_SCHEMA = """
@@ -238,6 +246,7 @@ def init_db() -> None:
             conn.execute("DROP TABLE IF EXISTS viral_refresh_state")
         conn.execute(VIRAL_VIDEOS_SCHEMA)
         conn.execute(VIRAL_REFRESH_STATE_SCHEMA)
+        conn.execute(LAST_UPDATE_STATE_SCHEMA)
         conn.execute(SAVED_CHANNELS_SCHEMA)
         conn.execute(MANUAL_ENTRY_CATEGORIES_SCHEMA)
         # 초안(대본) 탭 제거에 따른 정리. 이미 삭제된 DB에서는 그대로 no-op된다.
@@ -692,6 +701,24 @@ def set_viral_last_refreshed_at(iso_str: str) -> None:
             ON CONFLICT(id) DO UPDATE SET last_refreshed_at = excluded.last_refreshed_at
             """,
             (iso_str,),
+        )
+
+
+def get_last_update_at() -> str | None:
+    """대시보드 헤더용 마지막 업데이트 시각(KST, "YYYY-MM-DD HH:MM" 형식 문자열)."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT updated_at FROM last_update_state WHERE id = 1").fetchone()
+    return row["updated_at"] if row else None
+
+
+def set_last_update_at(value: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO last_update_state (id, updated_at) VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (value,),
         )
 
 

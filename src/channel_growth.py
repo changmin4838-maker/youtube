@@ -16,7 +16,6 @@ from src.config import (
 )
 from src.youtube_client import (
     fetch_channel_by_query,
-    get_channel_recent_video_stats,
     get_channel_recent_video_stats_via_playlist,
     get_channels_metadata,
     search_channel_ids,
@@ -106,8 +105,9 @@ def fetch_growing_channels(
 ) -> list[dict]:
     """채널 검색 -> 메타데이터 필터 -> 최근 업로드 분석 -> 추가 필터 순으로 급성장 채널을 찾는다.
 
-    최근 업로드 조회는 채널당 API 쿼터 소모가 크므로, 저비용인 메타데이터
-    (운영 개월/구독자) 필터를 먼저 적용해 조회 대상을 줄인다.
+    최근 업로드 조회는 channels.list에서 이미 받아온 업로드 재생목록 ID로
+    playlistItems.list(채널당 약 2~3 units)를 쓰므로, 여전히 저비용인 메타데이터
+    (운영 개월/구독자) 필터를 먼저 적용해 불필요한 후보를 줄인다.
     """
     channel_ids = search_channel_ids(keyword, max_results=max_candidates)
     metadata = get_channels_metadata(tuple(channel_ids))
@@ -127,7 +127,7 @@ def fetch_growing_channels(
 
     results = []
     for meta in candidates:
-        activity = get_channel_recent_video_stats(meta["channel_id"])
+        activity = get_channel_recent_video_stats_via_playlist(meta.get("uploads_playlist_id", ""))
         growth = compute_channel_growth(meta, activity)
         if growth is None:
             continue

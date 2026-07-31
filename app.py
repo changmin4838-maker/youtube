@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -48,8 +48,18 @@ st.set_page_config(page_title="요잇템 레이더", page_icon="🛍️", layout
 db.init_db()
 api_keys.ensure_default_key_migrated()
 
+KST = timezone(timedelta(hours=9))
+
+
+def mark_data_updated() -> None:
+    """검색/데이터 갱신 작업이 실행될 때마다 현재 KST 시각을 마지막 업데이트로 기록한다."""
+    db.set_last_update_at(datetime.now(KST).strftime("%Y-%m-%d %H:%M"))
+
+
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
+_last_update_at = db.get_last_update_at()
+st.caption(f"🕒 마지막 업데이트: {_last_update_at}" if _last_update_at else "🕒 업데이트 기록 없음")
 st.divider()
 
 
@@ -144,6 +154,7 @@ if search_clicked:
                 st.session_state["results_df"] = df
                 st.session_state["last_keyword"] = keyword.strip()
                 db.log_discoveries(df, keyword.strip())
+                mark_data_updated()
             except RuntimeError as e:
                 st.error(str(e))
             except HttpError as e:
@@ -546,7 +557,8 @@ with tab_viral:
 
     try:
         with st.spinner("바이럴 영상을 확인하는 중..."):
-            viral_videos.refresh_viral_videos()
+            if viral_videos.refresh_viral_videos():
+                mark_data_updated()
     except RuntimeError as e:
         st.error(str(e))
     except HttpError as e:
@@ -561,6 +573,7 @@ with tab_viral:
         with st.spinner("최신 인기 영상을 가져오는 중..."):
             try:
                 viral_videos.refresh_viral_videos(force=True)
+                mark_data_updated()
                 st.toast("바이럴 영상을 갱신했습니다.", icon="🔄")
                 st.rerun()
             except RuntimeError as e:
@@ -726,6 +739,7 @@ with tab_growth:
                     )
                     st.session_state["growth_results"] = channels
                     st.session_state["last_channel_keyword"] = channel_keyword.strip()
+                    mark_data_updated()
                 except RuntimeError as e:
                     st.error(str(e))
                 except HttpError as e:
@@ -770,6 +784,7 @@ with tab_growth:
                         direct_channel_query.strip()
                     )
                     st.session_state["direct_channel_searched"] = True
+                    mark_data_updated()
                 except RuntimeError as e:
                     st.error(str(e))
                 except HttpError as e:
@@ -836,6 +851,7 @@ with tab_growth:
                         (found if result is not None else not_found).append(result or q)
                     st.session_state["compare_results"] = found
                     st.session_state["compare_not_found"] = not_found
+                    mark_data_updated()
                 except RuntimeError as e:
                     st.error(str(e))
                 except HttpError as e:

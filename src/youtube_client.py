@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -71,21 +72,38 @@ def _build_client(api_key: str):
     return build("youtube", "v3", developerKey=api_key)
 
 
+# 일일 쿼터 소진을 뜻하는 reason만 포함한다. userRateLimitExceeded/rateLimitExceeded는
+# 단기(초 단위) 요청 제한이라 같은 키로 잠시 후 재시도하면 풀리므로 여기서 제외한다.
+# 이걸 quotaExceeded와 같이 취급하면 아직 쿼터가 남은 키를 "오늘 소진"으로 잘못 마킹해
+# 하루 종일 건너뛰게 되는 문제가 생긴다.
+_QUOTA_EXCEEDED_REASONS = {"quotaexceeded", "dailylimitexceeded"}
+
+
 def _is_quota_error(e: HttpError) -> bool:
+    """HTTP 403 + reason=quotaExceeded(또는 dailyLimitExceeded) 형태의 일일 쿼터 소진 에러인지 판별한다."""
     status = getattr(e.resp, "status", None)
-    if status == 429:
-        return True
-    if status == 403:
-        content = (e.content or b"").decode("utf-8", errors="ignore").lower()
-        return any(kw in content for kw in ("quotaexceeded", "dailylimitexceeded", "ratelimitexceeded"))
-    return False
+    if status not in (403, 429):
+        return False
+    content = (e.content or b"").decode("utf-8", errors="ignore")
+    try:
+        errors = json.loads(content).get("error", {}).get("errors", [])
+        reasons = {str(err.get("reason", "")).lower() for err in errors}
+    except (ValueError, AttributeError, TypeError):
+        reasons = set()
+    if reasons:
+        return bool(reasons & _QUOTA_EXCEEDED_REASONS)
+    # reason 필드를 못 찾았을 때(파싱 실패 등)를 위한 문자열 폴백.
+    return any(kw in content.lower() for kw in _QUOTA_EXCEEDED_REASONS)
 
 
 def execute_with_rotation(request_fn):
     """request_fn(youtube_client) -> dict 형태의 API 호출을 키 자동 전환과 함께 실행한다.
 
-    429(쿼터 초과) 발생 시 해당 키를 오늘 날짜로 소진 처리하고, 등록된 다음 키로 즉시
-    재시도한다. 등록된 키가 없거나 오늘 모든 키가 소진됐으면 RuntimeError를 발생시킨다.
+    HTTP 403 + reason=quotaExceeded(쿼터 소진) 발생 시 해당 키를 PT(태평양시간) 기준
+    오늘 날짜로 소진 처리해 DB에 기록하고, 등록된 다음 키로 즉시 재시도한다. 이렇게
+    기록해두면 같은 세션은 물론 페이지를 새로고침하거나 재시작해도 이미 소진된 키를
+    다시 호출해 시간을 낭비하지 않는다. 등록된 키가 없거나 오늘 모든 키가 소진됐으면
+    RuntimeError를 발생시킨다.
     """
     if not api_keys.has_any_key():
         raise RuntimeError(
@@ -97,7 +115,9 @@ def execute_with_rotation(request_fn):
         key_row = api_keys.get_next_available_key(exclude_ids=tried_ids)
         if key_row is None:
             raise RuntimeError(
-                "오늘 등록된 모든 키의 쿼터가 소진되었습니다. 새 키를 추가하거나 내일 다시 시도해주세요."
+                "등록된 모든 YouTube API 키의 일일 쿼터가 소진되었습니다. "
+                "쿼터는 PT(태평양시간) 자정(한국시간 기준 오후 4~5시경, 서머타임에 따라 달라짐)에 "
+                "초기화되니, 그 이후 다시 시도해주세요."
             )
         try:
             client = _build_client(key_row["api_key"])
@@ -194,32 +214,36 @@ def get_channels_stats(channel_ids: tuple[str, ...]) -> dict[str, int]:
     return stats
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_channel_recent_avg_views(channel_id: str, sample_size: int = 10) -> float:
-    """해당 채널의 최근 업로드 영상 N개 평균 조회수를 계산한다."""
-    if not channel_id:
-        return 0.0
-    search_response = execute_with_rotation(
-        lambda youtube: youtube.search()
-        .list(
-            channelId=channel_id,
-            part="id",
-            type="video",
-            order="date",
-            maxResults=sample_size,
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_channels_uploads_playlists(channel_ids: tuple[str, ...]) -> dict[str, str]:
+    """채널 ID들의 업로드 재생목록 ID(uploads playlist)를 조회한다.
+
+    채널당 search.list(100 units)로 최근 업로드를 검색하는 대신, 이 ID로
+    playlistItems.list(1 unit)를 써서 훨씬 저렴하게 같은 정보를 얻을 수 있다.
+    """
+    if not channel_ids:
+        return {}
+    playlists: dict[str, str] = {}
+    unique_ids = list(dict.fromkeys(channel_ids))
+    for i in range(0, len(unique_ids), 50):
+        chunk = unique_ids[i : i + 50]
+        response = execute_with_rotation(
+            lambda youtube: youtube.channels().list(part="contentDetails", id=",".join(chunk)).execute()
         )
-        .execute()
-    )
-    ids = [item["id"]["videoId"] for item in search_response.get("items", [])]
-    if not ids:
+        for item in response.get("items", []):
+            playlist_id = item.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads", "")
+            if playlist_id:
+                playlists[item["id"]] = playlist_id
+    return playlists
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_channel_recent_avg_views(uploads_playlist_id: str, sample_size: int = 10) -> float:
+    """해당 채널의 최근 업로드 영상 N개 평균 조회수를 계산한다(playlistItems.list 기반, search.list 미사용)."""
+    if not uploads_playlist_id:
         return 0.0
-    stats_response = execute_with_rotation(
-        lambda youtube: youtube.videos().list(part="statistics", id=",".join(ids)).execute()
-    )
-    views = [
-        int(item.get("statistics", {}).get("viewCount", 0))
-        for item in stats_response.get("items", [])
-    ]
+    activity = get_channel_recent_video_stats_via_playlist(uploads_playlist_id, sample_size=sample_size)
+    views = [v["view_count"] for v in activity["videos"]]
     return sum(views) / len(views) if views else 0.0
 
 
@@ -252,8 +276,13 @@ def fetch_search_results(
     if sub_max:
         videos = [v for v in videos if v["subscriber_count"] <= sub_max]
 
+    uploads_playlist_ids = get_channels_uploads_playlists(
+        tuple({v["channel_id"] for v in videos if v["channel_id"]})
+    )
     for v in videos:
-        v["channel_avg_views"] = get_channel_recent_avg_views(v["channel_id"])
+        v["channel_avg_views"] = get_channel_recent_avg_views(
+            uploads_playlist_ids.get(v["channel_id"], "")
+        )
 
     return videos
 
@@ -274,7 +303,12 @@ def search_channel_ids(keyword: str, max_results: int = GROWTH_MAX_CANDIDATES) -
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_channels_metadata(channel_ids: tuple[str, ...]) -> dict[str, dict]:
-    """채널 ID들의 개설일/구독자수/총 영상수 등 메타데이터를 조회한다."""
+    """채널 ID들의 개설일/구독자수/총 영상수/업로드 재생목록 ID 등 메타데이터를 조회한다.
+
+    part에 contentDetails를 포함해도 channels.list 호출 비용은 그대로이므로, 이 김에
+    업로드 재생목록 ID도 함께 받아둔다(최근 업로드 조회를 search.list 대신
+    playlistItems.list로 저렴하게 하기 위해 필요).
+    """
     if not channel_ids:
         return {}
     metadata: dict[str, dict] = {}
@@ -283,12 +317,13 @@ def get_channels_metadata(channel_ids: tuple[str, ...]) -> dict[str, dict]:
         chunk = unique_ids[i : i + 50]
         response = execute_with_rotation(
             lambda youtube: youtube.channels()
-            .list(part="snippet,statistics", id=",".join(chunk))
+            .list(part="snippet,statistics,contentDetails", id=",".join(chunk))
             .execute()
         )
         for item in response.get("items", []):
             snippet = item["snippet"]
             stats = item.get("statistics", {})
+            content = item.get("contentDetails", {})
             thumbnails = snippet.get("thumbnails", {})
             thumbnail_url = (
                 thumbnails.get("high")
@@ -304,64 +339,9 @@ def get_channels_metadata(channel_ids: tuple[str, ...]) -> dict[str, dict]:
                 "published_at": snippet.get("publishedAt", ""),
                 "subscriber_count": int(sub_count) if sub_count is not None else 0,
                 "video_count": int(stats.get("videoCount", 0)),
+                "uploads_playlist_id": content.get("relatedPlaylists", {}).get("uploads", ""),
             }
     return metadata
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_channel_recent_video_stats(
-    channel_id: str,
-    sample_size: int = GROWTH_RECENT_SAMPLE_SIZE,
-    recent_window_days: int = GROWTH_RECENT_UPLOAD_WINDOW_DAYS,
-) -> dict:
-    """채널의 최근 업로드(최대 50개)를 조회해 최근 N개 상세와 최근 기간 업로드 수를 반환한다.
-
-    최근 기간 업로드 수는 최근 50개 중에서 집계하므로, 한 채널이 그 기간에
-    50개 넘게 올린 경우에는 과소 집계될 수 있다(개인용 도구 수준에서는 드문 케이스).
-    """
-    search_response = execute_with_rotation(
-        lambda youtube: youtube.search()
-        .list(channelId=channel_id, part="id", type="video", order="date", maxResults=50)
-        .execute()
-    )
-    ids = [item["id"]["videoId"] for item in search_response.get("items", [])]
-    if not ids:
-        return {"videos": [], "upload_count_recent": 0}
-
-    videos: list[dict] = []
-    for i in range(0, len(ids), 50):
-        chunk = ids[i : i + 50]
-        response = execute_with_rotation(
-            lambda youtube: youtube.videos()
-            .list(part="snippet,statistics,contentDetails", id=",".join(chunk))
-            .execute()
-        )
-        for item in response.get("items", []):
-            snippet = item["snippet"]
-            stats = item.get("statistics", {})
-            content = item.get("contentDetails", {})
-            duration_seconds = parse_duration_seconds(content.get("duration", ""))
-            videos.append(
-                {
-                    "video_id": item["id"],
-                    "title": snippet.get("title", ""),
-                    "published_at": snippet.get("publishedAt", ""),
-                    "view_count": int(stats.get("viewCount", 0)),
-                    "duration_seconds": duration_seconds,
-                    "is_short": duration_seconds > 0 and duration_seconds <= SHORTS_MAX_SECONDS,
-                }
-            )
-
-    videos.sort(key=lambda v: v["published_at"], reverse=True)
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_window_days)
-    upload_count_recent = sum(
-        1
-        for v in videos
-        if datetime.fromisoformat(v["published_at"].replace("Z", "+00:00")) >= cutoff
-    )
-
-    return {"videos": videos[:sample_size], "upload_count_recent": upload_count_recent}
 
 
 # ---------------------------------------------------------------------------
@@ -424,9 +404,10 @@ def get_channel_recent_video_stats_via_playlist(
 ) -> dict:
     """업로드 재생목록(playlistItems.list)에서 최근 업로드를 가져온다.
 
-    채널당 channels.list(1) + playlistItems.list(1) + videos.list(1) = 총 3 units로,
-    기존 급성장 채널 탐색(get_channel_recent_video_stats, search.list 기반 채널당 약 101 units)보다
-    훨씬 저렴하다. 반환 형태는 get_channel_recent_video_stats와 동일하게 맞춰 판정 로직을 그대로 재사용한다.
+    channels.list에서 이미 받아온 업로드 재생목록 ID를 받아 playlistItems.list(1) +
+    videos.list(1) = 채널당 약 2 units만 쓴다. search.list 기반 조회(채널당 약 100
+    units)보다 훨씬 저렴하며, 급성장 채널 탐색(channel_growth.fetch_growing_channels)과
+    "채널 직접 검색"(fetch_channel_by_direct_query) 양쪽에서 공통으로 쓰인다.
     """
     if not uploads_playlist_id:
         return {"videos": [], "upload_count_recent": 0}
